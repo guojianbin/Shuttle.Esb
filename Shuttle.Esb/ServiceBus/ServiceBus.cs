@@ -1,187 +1,242 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Shuttle.Core.Infrastructure;
 
 namespace Shuttle.Esb
 {
-	public class ServiceBus : IServiceBus
-	{
-		private readonly IMessageSender _messageSender;
+    public class ServiceBus : IServiceBus
+    {
+        private readonly ILog _log;
 
-		private IProcessorThreadPool _controlThreadPool;
-		private IProcessorThreadPool _inboxThreadPool;
-		private IProcessorThreadPool _outboxThreadPool;
-		private IProcessorThreadPool _deferredMessageThreadPool;
+        private readonly IMessageSender _messageSender;
 
-		public ServiceBus(IServiceBusConfiguration configuration)
-		{
-			Guard.AgainstNull(configuration, "configuration");
+        private IProcessorThreadPool _controlThreadPool;
+        private DateTime? _dateStarted;
+        private DateTime? _dateStopped;
+        private IProcessorThreadPool _deferredMessageThreadPool;
+        private IProcessorThreadPool _inboxThreadPool;
+        private IProcessorThreadPool _outboxThreadPool;
 
-			Configuration = configuration;
+        public ServiceBus(IServiceBusConfiguration configuration)
+        {
+            Guard.AgainstNull(configuration, "configuration");
 
-			Events = new ServiceBusEvents();
+            Configuration = configuration;
 
-			_messageSender = new MessageSender(this);
-		}
+            Events = new ServiceBusEvents();
 
-		public IServiceBusConfiguration Configuration { get; private set; }
-		public IServiceBusEvents Events { get; private set; }
+            _messageSender = new MessageSender(this);
 
-		public IServiceBus Start()
-		{
-			if (Started)
-			{
-				throw new ApplicationException(EsbResources.ServiceBusInstanceAlreadyStarted);
-			}
+            _log = Log.For(this);
+        }
 
-			GuardAgainstInvalidConfiguration();
+        public IServiceBusConfiguration Configuration { get; }
+        public IServiceBusEvents Events { get; }
 
-			// cannot be in startup pipeline as some modules may need to observe the startup pipeline
-			foreach (var module in Configuration.Modules)
-			{
-				module.Initialize(this);
-			}
+        public IServiceBus Start()
+        {
+            if (Started)
+            {
+                throw new ApplicationException(EsbResources.ServiceBusInstanceAlreadyStarted);
+            }
 
-			var startupPipeline = new StartupPipeline(this);
+            _log.Information("[starting]");
 
-			Events.OnPipelineCreated(this, new PipelineEventArgs(startupPipeline));
+            GuardAgainstInvalidConfiguration();
 
-			startupPipeline.Execute();
+            // cannot be in startup pipeline as some modules may need to observe the startup pipeline
+            foreach (var module in Configuration.Modules)
+            {
+                module.Initialize(this);
+            }
 
-			_inboxThreadPool = startupPipeline.State.Get<IProcessorThreadPool>("InboxThreadPool");
-			_controlThreadPool = startupPipeline.State.Get<IProcessorThreadPool>("ControlInboxThreadPool");
-			_outboxThreadPool = startupPipeline.State.Get<IProcessorThreadPool>("OutboxThreadPool");
-			_deferredMessageThreadPool = startupPipeline.State.Get<IProcessorThreadPool>("DeferredMessageThreadPool");
+            var startupPipeline = new StartupPipeline(this);
 
-			Started = true;
+            Events.OnPipelineCreated(this, new PipelineEventArgs(startupPipeline));
 
-			return this;
-		}
+            startupPipeline.Execute();
 
-		private void GuardAgainstInvalidConfiguration()
-		{
-			Guard.Against<EsbConfigurationException>(Configuration.Serializer == null, EsbResources.NoSerializerException);
+            _inboxThreadPool = startupPipeline.State.Get<IProcessorThreadPool>("InboxThreadPool");
+            _controlThreadPool = startupPipeline.State.Get<IProcessorThreadPool>("ControlInboxThreadPool");
+            _outboxThreadPool = startupPipeline.State.Get<IProcessorThreadPool>("OutboxThreadPool");
+            _deferredMessageThreadPool = startupPipeline.State.Get<IProcessorThreadPool>("DeferredMessageThreadPool");
 
-			Guard.Against<EsbConfigurationException>(Configuration.MessageHandlerFactory == null,
-				EsbResources.NoMessageHandlerFactoryException);
+            Started = true;
 
-			Guard.Against<WorkerException>(Configuration.IsWorker && !Configuration.HasInbox,
-				EsbResources.WorkerRequiresInboxException);
+            _dateStarted = DateTime.Now;
 
-			if (Configuration.HasInbox)
-			{
-				Guard.Against<EsbConfigurationException>(Configuration.Inbox.WorkQueue == null,
-					string.Format(EsbResources.RequiredQueueMissing, "Inbox.WorkQueue"));
+            _log.Information("[started]");
 
-				Guard.Against<EsbConfigurationException>(Configuration.Inbox.ErrorQueue == null,
-					string.Format(EsbResources.RequiredQueueMissing, "Inbox.ErrorQueue"));
-			}
+            return this;
+        }
 
-			if (Configuration.HasOutbox)
-			{
-				Guard.Against<EsbConfigurationException>(Configuration.Outbox.WorkQueue == null,
-					string.Format(EsbResources.RequiredQueueMissing, "Outbox.WorkQueue"));
+        public void Stop()
+        {
+            if (!Started)
+            {
+                return;
+            }
 
-				Guard.Against<EsbConfigurationException>(Configuration.Outbox.ErrorQueue == null,
-					string.Format(EsbResources.RequiredQueueMissing, "Outbox.ErrorQueue"));
-			}
+            _log.Information("[stopping]");
 
-			if (Configuration.HasControlInbox)
-			{
-				Guard.Against<EsbConfigurationException>(Configuration.ControlInbox.WorkQueue == null,
-					string.Format(EsbResources.RequiredQueueMissing, "ControlInbox.WorkQueue"));
+            var frames = new StackTrace().GetFrames();
 
-				Guard.Against<EsbConfigurationException>(Configuration.ControlInbox.ErrorQueue == null,
-					string.Format(EsbResources.RequiredQueueMissing, "ControlInbox.ErrorQueue"));
-			}
-		}
+            if (frames != null)
+            {
+                foreach (var frame in frames)
+                {
+                    _log.Information(string.Format("[frame] : {0}", frame));
+                }
+            }
 
-		public void Stop()
-		{
-			if (!Started)
-			{
-				return;
-			}
+            Configuration.Modules.AttemptDispose();
 
-			Configuration.Modules.AttemptDispose();
+            if (Configuration.HasInbox)
+            {
+                if (Configuration.Inbox.HasDeferredQueue)
+                {
+                    _deferredMessageThreadPool.Dispose();
+                }
 
-			if (Configuration.HasInbox)
-			{
-				if (Configuration.Inbox.HasDeferredQueue)
-				{
-					_deferredMessageThreadPool.Dispose();
-				}
+                _inboxThreadPool.Dispose();
+            }
 
-				_inboxThreadPool.Dispose();
-			}
+            if (Configuration.HasControlInbox)
+            {
+                _controlThreadPool.Dispose();
+            }
 
-			if (Configuration.HasControlInbox)
-			{
-				_controlThreadPool.Dispose();
-			}
+            if (Configuration.HasOutbox)
+            {
+                _outboxThreadPool.Dispose();
+            }
 
-			if (Configuration.HasOutbox)
-			{
-				_outboxThreadPool.Dispose();
-			}
+            Configuration.QueueManager.AttemptDispose();
 
-			Configuration.QueueManager.AttemptDispose();
+            _log.Information("[stopped]");
 
-			Started = false;
-		}
+            _dateStopped = DateTime.Now;
 
-		public bool Started { get; private set; }
+            Started = false;
+        }
 
-		public void Dispose()
-		{
-			Stop();
-		}
+        public bool Started { get; private set; }
 
-		public static IServiceBus Create()
-		{
-			return Create(null);
-		}
+        public void Dispose()
+        {
+            Stop();
+        }
 
-		public static IServiceBus Create(Action<DefaultConfigurator> configure)
-		{
-			var configurator = new DefaultConfigurator();
+        public TransportMessage CreateTransportMessage(object message, Action<TransportMessageConfigurator> configure)
+        {
+            GuardStarted();
 
-			if (configure != null)
-			{
-				configure.Invoke(configurator);
-			}
+            return _messageSender.CreateTransportMessage(message, configure);
+        }
 
-			return new ServiceBus(configurator.Configuration());
-		}
+        public void Dispatch(TransportMessage transportMessage)
+        {
+            GuardStarted();
 
-		public TransportMessage CreateTransportMessage(object message, Action<TransportMessageConfigurator> configure)
-		{
-			return _messageSender.CreateTransportMessage(message, configure);
-		}
+            _messageSender.Dispatch(transportMessage);
+        }
 
-		public void Dispatch(TransportMessage transportMessage)
-		{
-			_messageSender.Dispatch(transportMessage);
-		}
+        public TransportMessage Send(object message)
+        {
+            GuardStarted();
 
-		public TransportMessage Send(object message)
-		{
-			return _messageSender.Send(message);
-		}
+            return _messageSender.Send(message);
+        }
 
-		public TransportMessage Send(object message, Action<TransportMessageConfigurator> configure)
-		{
-			return _messageSender.Send(message, configure);
-		}
+        public TransportMessage Send(object message, Action<TransportMessageConfigurator> configure)
+        {
+            GuardStarted();
 
-		public IEnumerable<TransportMessage> Publish(object message)
-		{
-			return _messageSender.Publish(message);
-		}
+            return _messageSender.Send(message, configure);
+        }
 
-		public IEnumerable<TransportMessage> Publish(object message, Action<TransportMessageConfigurator> configure)
-		{
-			return _messageSender.Publish(message, configure);
-		}
-	}
+        public IEnumerable<TransportMessage> Publish(object message)
+        {
+            GuardStarted();
+
+            return _messageSender.Publish(message);
+        }
+
+        public IEnumerable<TransportMessage> Publish(object message, Action<TransportMessageConfigurator> configure)
+        {
+            GuardStarted();
+
+            return _messageSender.Publish(message, configure);
+        }
+
+        private void GuardAgainstInvalidConfiguration()
+        {
+            Guard.Against<EsbConfigurationException>(Configuration.Serializer == null,
+                EsbResources.NoSerializerException);
+
+            Guard.Against<EsbConfigurationException>(Configuration.MessageHandlerFactory == null,
+                EsbResources.NoMessageHandlerFactoryException);
+
+            Guard.Against<WorkerException>(Configuration.IsWorker && !Configuration.HasInbox,
+                EsbResources.WorkerRequiresInboxException);
+
+            if (Configuration.HasInbox)
+            {
+                Guard.Against<EsbConfigurationException>(Configuration.Inbox.WorkQueue == null,
+                    string.Format(EsbResources.RequiredQueueMissing, "Inbox.WorkQueue"));
+
+                Guard.Against<EsbConfigurationException>(Configuration.Inbox.ErrorQueue == null,
+                    string.Format(EsbResources.RequiredQueueMissing, "Inbox.ErrorQueue"));
+            }
+
+            if (Configuration.HasOutbox)
+            {
+                Guard.Against<EsbConfigurationException>(Configuration.Outbox.WorkQueue == null,
+                    string.Format(EsbResources.RequiredQueueMissing, "Outbox.WorkQueue"));
+
+                Guard.Against<EsbConfigurationException>(Configuration.Outbox.ErrorQueue == null,
+                    string.Format(EsbResources.RequiredQueueMissing, "Outbox.ErrorQueue"));
+            }
+
+            if (Configuration.HasControlInbox)
+            {
+                Guard.Against<EsbConfigurationException>(Configuration.ControlInbox.WorkQueue == null,
+                    string.Format(EsbResources.RequiredQueueMissing, "ControlInbox.WorkQueue"));
+
+                Guard.Against<EsbConfigurationException>(Configuration.ControlInbox.ErrorQueue == null,
+                    string.Format(EsbResources.RequiredQueueMissing, "ControlInbox.ErrorQueue"));
+            }
+        }
+
+        public static IServiceBus Create()
+        {
+            return Create(null);
+        }
+
+        public static IServiceBus Create(Action<DefaultConfigurator> configure)
+        {
+            var configurator = new DefaultConfigurator();
+
+            if (configure != null)
+            {
+                configure.Invoke(configurator);
+            }
+
+            return new ServiceBus(configurator.Configuration());
+        }
+
+        private void GuardStarted()
+        {
+            if (Started)
+            {
+                return;
+            }
+
+            throw new InvalidOperationException(
+                string.Format("The ServiceBus has not been started.  Is started '{0}' and stopped '{1}'.",
+                    _dateStarted.HasValue ? _dateStarted.Value.ToString("O") : "(never)",
+                    _dateStopped.HasValue ? _dateStopped.Value.ToString("O") : "(never)"));
+        }
+    }
 }
